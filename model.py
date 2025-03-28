@@ -10,6 +10,8 @@ from PIL import Image
 from peft import LoraConfig, get_peft_model
 import json
 import os
+from safetensors.torch import save_model, load_model
+
 
 # Configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -22,14 +24,18 @@ class SportVLM(torch.nn.Module):
         
         # Freeze vision encoder
         self.vision_encoder = TimesformerModel.from_pretrained(
-            "facebook/timesformer-base-finetuned-k600",
-            num_frames = NUM_FRAMES,
-        )
+                    "facebook/timesformer-base-finetuned-k600",
+                    num_frames = NUM_FRAMES,
+                    cache_dir = "/data/users/edbianchi/.cache"
+            )
         
         self.vision_encoder.requires_grad_(False)
         
         # Load LLM
-        self.llm = AutoModelForCausalLM.from_pretrained(LLM_CHECKPOINT, torch_dtype=torch.float16)
+        self.llm = AutoModelForCausalLM.from_pretrained(LLM_CHECKPOINT, 
+                    torch_dtype=torch.bfloat16, 
+                    cache_dir = "/data/users/edbianchi/.cache"
+            )
         
         # Video projector
         self.video_adapter = torch.nn.Sequential(
@@ -135,7 +141,7 @@ class VideoTextDataset(torch.utils.data.Dataset):
             ann = self.annotations[idx]
             
             # Load video with fallback
-            video = torch.zeros((1, NUM_FRAMES, 3, 224, 224), device=DEVICE)
+            video = torch.zeros((1, NUM_FRAMES, 3, 224, 224))
             if os.path.exists(ann["video_path"]):
                 try:
                     video = load_video(ann["video_path"])
@@ -172,7 +178,7 @@ class VideoTextDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"Error processing sample {idx}: {str(e)}")
             return {
-                'video': torch.zeros((NUM_FRAMES, 3, 224, 224), device=DEVICE),
+                'video': torch.zeros((NUM_FRAMES, 3, 224, 224)),
                 'input_ids': torch.zeros(512, dtype=torch.long),
                 'attention_mask': torch.zeros(512, dtype=torch.long),
                 'labels': torch.zeros(512, dtype=torch.long)
@@ -194,36 +200,36 @@ def train():
     # Training configuration
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=3,
-        per_device_train_batch_size=1,  # Reduce batch size to lower memory usage
+        num_train_epochs=20,
+        per_device_train_batch_size=10,  # Reduce batch size to lower memory usage
         learning_rate=1e-3,
         warmup_ratio=0.1,
-        gradient_accumulation_steps=1,  # Reduce gradient accumulation steps
+        gradient_accumulation_steps=3,  # Reduce gradient accumulation steps
         fp16=torch.cuda.is_available(),  # Enable mixed precision
-        logging_steps=5,
+        logging_steps=2,
         save_strategy="epoch",
         remove_unused_columns=False,
-        dataloader_num_workers=0  # Disable multiprocessing for data loading
-    )
+        save_safetensors=False,
+        )
     
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=lambda batch: {
-            'video': torch.stack([x['video'] for x in batch]).to(DEVICE),
-            'input_ids': torch.stack([x['input_ids'] for x in batch]).to(DEVICE),
-            'attention_mask': torch.stack([x['attention_mask'] for x in batch]).to(DEVICE),
-            'labels': torch.stack([x['labels'] for x in batch]).to(DEVICE)
-        }
+            'video': torch.stack([x['video'] for x in batch]),
+            'input_ids': torch.stack([x['input_ids'] for x in batch]),
+            'attention_mask': torch.stack([x['attention_mask'] for x in batch]),
+            'labels': torch.stack([x['labels'] for x in batch])
+        },
     )
     trainer.train()
-    trainer.save_model("trained_model")
+    torch.save(model.state_dict(), "trained_models/sportvlm_complete.pth")
+    print("Model saved to trained_models/sportvlm_complete.pth")
 
 def generate_analysis(model, video_path):
-    model.eval()
     try:
-        video = load_video(video_path)
+        video = load_video(video_path).to(DEVICE)
     except Exception as e:
         print(f"Error loading video: {str(e)}")
         return "Video analysis failed: invalid input"
@@ -292,16 +298,20 @@ def load_video(video_path):
     video_tensor = torch.stack(frames)  # [num_frames, 3, H, W]
     
     # Add batch dimension to make it [1, num_frames, 3, height, width]
-    return video_tensor.unsqueeze(0).to(DEVICE)  # [1, num_frames, 3, H, W]
+    return video_tensor.unsqueeze(0)  # [1, num_frames, 3, H, W]
 
 if __name__ == "__main__":
     train()
     
     # Load trained model
+    print("Initializing model...")
     model = SportVLM()
-    model.load_state_dict(torch.load("trained_model/pytorch_model.bin"))
+    print("Loading model weights...")
+    model.load_state_dict(torch.load("trained_models/sportvlm_complete.pth"))
     model.to(DEVICE).eval()
+    print("Model loaded successfully.")
+    print("Generating analysis...")
     
-    analysis = generate_analysis(model, "/Users/edoardobianchi/DATA_SCIENZE/CLIMBING/DynamicCropper/cam02.mp4")
+    analysis = generate_analysis(model, "/data/users/edbianchi/ProEstVideo/cam02.mp4")
     print("\n=== ANALYSIS ===")
     print(analysis)
