@@ -12,7 +12,7 @@ import json
 import os
 
 # Configuration
-DEVICE = "cuda" if torch.cuda.is_available() else "mps"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_FRAMES = 8
 LLM_CHECKPOINT = "HuggingFaceTB/SmolLM2-135M"
 
@@ -183,7 +183,7 @@ def train():
     
     # Initialize dataset with validation
     train_dataset = VideoTextDataset(
-        annotation_path="/Users/edoardobianchi/DATA_SCIENZE/CLIMBING/ProEst/annotations/annotation.jsonl",
+        annotation_path="/data/users/edbianchi/ProfiVLM/annotations/annotation.jsonl",
         tokenizer=model.tokenizer
     )
     
