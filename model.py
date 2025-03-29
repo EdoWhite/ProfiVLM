@@ -1,7 +1,8 @@
 import torch
+import av
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, 
-    TimesformerModel, TrainingArguments, Trainer
+    TimesformerModel, TrainingArguments, Trainer, AutoImageProcessor
 )
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ from functools import partial
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_FRAMES = 8
 LLM_CHECKPOINT = "HuggingFaceTB/SmolLM2-135M-Instruct"
+VISION_ENCODER = "facebook/timesformer-base-finetuned-k600"
 
 class SportVLM(torch.nn.Module):
     def __init__(self):
@@ -36,9 +38,10 @@ class SportVLM(torch.nn.Module):
         
         # Vision encoder
         self.vision_encoder = TimesformerModel.from_pretrained(
-            "facebook/timesformer-base-finetuned-k600",
+            VISION_ENCODER,
             num_frames=NUM_FRAMES
         ).requires_grad_(False)
+        self.vision_processor = AutoImageProcessor.from_pretrained(VISION_ENCODER)
         
         # Projector
         self.video_adapter = torch.nn.Sequential(
@@ -71,11 +74,10 @@ class SportVLM(torch.nn.Module):
         self.llm.resize_token_embeddings(len(self.tokenizer))
     
     def forward(self, video, input_ids, attention_mask, labels):
-        assert video.ndim == 5, f"Expected video tensor of shape [B,C,T,H,W], got {video.shape}"
-        assert video.size(1) == 3, f"Expected 3 channels, got {video.size(1)}"
-        
+        print("Forward pass")
         # Video processing
-        video_features = self.vision_encoder(video).last_hidden_state.mean(dim=1)
+        inputs = self.vision_processor(video, return_tensors="pt")
+        video_features = self.vision_encoder(**inputs).last_hidden_state
         video_emb = self.video_adapter(video_features)
         
         # Get text embeddings
@@ -127,8 +129,11 @@ class VideoTextDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         ann = self.annotations[idx]
         try:
+            container = av.open(ann["video_path"])
+            indices = sample_frame_indices(clip_len=NUM_FRAMES, frame_sample_rate=4, seg_len=container.streams.video[0].frames)
+            video = read_video_pyav(container, indices)
             return {
-                'video': load_video(ann["video_path"]),
+                'video': video,
                 'text': f"<video>\nAnalysis: {ann['analysis']}\nProficiency: {ann['proficiency_level']}"
             }
         except Exception as e:
@@ -153,7 +158,8 @@ def collate_fn(examples, tokenizer):
         }])
     
     # Process videos
-    video_tensors = torch.cat([v if v.ndim == 5 else v.unsqueeze(0) for v in videos if v is not None])
+    #video_tensors = torch.cat([v for v in videos])
+    #print(f"Batch video shape: {video_tensors.shape}")
     
     # Process texts
     batch = tokenizer.apply_chat_template(
@@ -170,7 +176,7 @@ def collate_fn(examples, tokenizer):
     labels[labels == tokenizer.convert_tokens_to_ids("<video>")] = -100
     
     return {
-        "video": video_tensors,
+        "video": videos,
         "input_ids": batch["input_ids"],
         "attention_mask": batch["attention_mask"],
         "labels": labels
@@ -252,6 +258,43 @@ def generate_analysis(model, video_path):
     
     return model.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+def read_video_pyav(container, indices):
+    '''
+    Decode the video with PyAV decoder.
+    Args:
+        container (`av.container.input.InputContainer`): PyAV container.
+        indices (`List[int]`): List of frame indices to decode.
+    Returns:
+        result (np.ndarray): np array of decoded frames of shape (num_frames, height, width, 3).
+    '''
+    frames = []
+    container.seek(0)
+    start_index = indices[0]
+    end_index = indices[-1]
+    for i, frame in enumerate(container.decode(video=0)):
+        if i > end_index:
+            break
+        if i >= start_index and i in indices:
+            frames.append(frame)
+    return np.stack([x.to_ndarray(format="rgb24") for x in frames])
+
+def sample_frame_indices(clip_len, frame_sample_rate, seg_len):
+    '''
+    Sample a given number of frame indices from the video.
+    Args:
+        clip_len (`int`): Total number of frames to sample.
+        frame_sample_rate (`int`): Sample every n-th frame.
+        seg_len (`int`): Maximum allowed index of sample's last frame.
+    Returns:
+        indices (`List[int]`): List of sampled frame indices
+    '''
+    converted_len = int(clip_len * frame_sample_rate)
+    end_idx = np.random.randint(converted_len, seg_len)
+    start_idx = end_idx - converted_len
+    indices = np.linspace(start_idx, end_idx, num=clip_len)
+    indices = np.clip(indices, start_idx, end_idx - 1).astype(np.int64)
+    return indices
+
 def load_video(video_path):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -276,9 +319,12 @@ def load_video(video_path):
     ])
     
     # Return shape: [1, C, T, H, W]
-    return torch.stack([
+    ret = torch.stack([
         transform(Image.fromarray(f)) for f in frames
-    ]).unsqueeze(0).permute(0, 2, 1, 3, 4)
+    ]).unsqueeze(0).permute(0, 1, 2, 3, 4)
+    
+    print(f"Loaded video with shape {ret.shape}")
+    return ret
 
 if __name__ == "__main__":
     train()
